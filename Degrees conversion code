@@ -1,0 +1,306 @@
+/**
+ * Pole Tilt Conversion — Vendor + Add-ons (TypeScript)
+ * ----------------------------------------------------
+ * - Preserves vendor decode & angle helpers
+ * - Adds simple per-axis tilt in degrees (xDeg, yDeg, zDeg)
+ * - Supports install calibration: axis flips + per-axis angle offsets
+ * - No external dependencies
+ *
+ * Usage:
+ *   import {
+ *     convertPayloadToDegrees,
+ *     convertWithCalibration,
+ *     CALIB_POLE_V1,
+ *     fitOffsetsFromPair
+ *   } from "./pole-tilt";
+ *
+ *   const out = convertPayloadToDegrees("0a001a7f0002009603e4ffe100", {
+ *     flipX:false, flipY:false, flipZ:false, magnitudeOnly:false, normalizeSigned:true, inputIsMg:true
+ *   });
+ *
+ *   const outCal = convertWithCalibration("0a001a7f0002009603e4ffe100", CALIB_POLE_V1);
+ */
+
+// -------------------- Internal helpers --------------------
+
+const { atan2, sqrt, PI } = Math;
+const toDeg = (rad: number) => (rad * 180) / PI;
+
+function readInt16BE(b: Uint8Array, i: number): number {
+  const v = (b[i] << 8) | b[i + 1];
+  return (v & 0x8000) ? v - 0x10000 : v;
+}
+
+function readInt32BE(b: Uint8Array, i: number): number {
+  return (
+    (b[i] << 24) |
+    (b[i + 1] << 16) |
+    (b[i + 2] << 8) |
+    (b[i + 3] << 0)
+  ) >> 0; // coerce to signed 32-bit
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.replace(/^0x/, "").trim();
+  const pairs = clean.match(/[\da-f]{2}/gi);
+  if (!pairs) return new Uint8Array();
+  return new Uint8Array(pairs.map(h => parseInt(h, 16)));
+}
+
+function norm180(deg: number): number {
+  // Normalize to [-180, +180]
+  return ((deg + 180) % 360 + 360) % 360 - 180;
+}
+
+function maybeAbs(v: number, on?: boolean): number {
+  return on ? Math.abs(v) : v;
+}
+
+// -------------------- Types --------------------
+
+export type GVec = { x: number; y: number; z: number };
+
+export type DegOptions = {
+  /** Flip axes to match physical installation */
+  flipX?: boolean;
+  flipY?: boolean;
+  flipZ?: boolean;
+  /** Return absolute magnitudes (all positive) */
+  magnitudeOnly?: boolean;
+  /** Keep signed angles normalized to [-180, +180] */
+  normalizeSigned?: boolean; // default true
+  /** Set false if vendor values are already in 'g' units (not mg) */
+  inputIsMg?: boolean; // default true
+};
+
+export type CalibrationProfile = {
+  flipX?: boolean;
+  flipY?: boolean;
+  flipZ?: boolean;
+  /** Angle offsets in degrees, applied AFTER simple xDeg/yDeg/zDeg computation */
+  bx?: number;
+  by?: number;
+  bz?: number;
+};
+
+// -------------------- Vendor decode (as shared) --------------------
+
+/**
+ * decodePayloadHex
+ * - Supports:
+ *   * messageType 0x0A (event), eventType 0x02 (MOTION_END) -> int16 XYZ
+ *   * messageType 0x07 (config),   subType   0x02           -> int32 XYZ
+ * - Vendor sign convention: x = -val, y = +val, z = -val
+ * - Returns gravity vector (typically in mg)
+ */
+export function decodePayloadHex(payloadHex: string): GVec | undefined {
+  const buf = hexToBytes(payloadHex);
+  if (buf.length < 12) return undefined;
+
+  const messageType = buf[0];
+
+  if (messageType === 0x0a) {
+    // event
+    const eventType = buf[5];
+    if (eventType === 0x02) {
+      // MOTION_END
+      const x = -readInt16BE(buf, 6);
+      const y =  readInt16BE(buf, 8);
+      const z = -readInt16BE(buf,10);
+      return { x, y, z };
+    }
+  } else if (messageType === 0x07) {
+    // config/shock/activity
+    const subType = buf[5];
+    if (subType === 0x02) {
+      const x = -readInt32BE(buf, 7);
+      const y =  readInt32BE(buf,12);
+      const z = -readInt32BE(buf,17);
+      return { x, y, z };
+    }
+  }
+  return undefined;
+}
+
+// -------------------- Vendor angle helpers (degrees) --------------------
+
+/** theta: tilt from vertical (angle between vertical and pole) */
+export function calculateTheta(g: GVec): number {
+  return toDeg(atan2(sqrt(g.x * g.x + g.z * g.z), g.y));
+}
+
+/** phiLocal: heading in device X–Z plane (signed degrees) */
+export function calculateLocalPhi(g: GVec): number {
+  return toDeg(atan2(g.x, g.z));
+}
+
+/** vendor tiltX: atan2(y, x) in degrees */
+export function calculateTiltX(g: GVec): number {
+  return toDeg(atan2(g.y, g.x));
+}
+
+/** vendor tiltZ: atan2(y, z) in degrees */
+export function calculateTiltZ(g: GVec): number {
+  return toDeg(atan2(g.y, g.z));
+}
+
+// -------------------- Add-on: simple per-axis tilt (degrees) --------------------
+
+/**
+ * Convert a gravity vector to simple per-axis tilt angles (degrees):
+ *   xDeg = atan2(ax, sqrt(ay^2 + az^2)) * 180/pi
+ *   yDeg = atan2(ay, sqrt(ax^2 + az^2)) * 180/pi
+ *   zDeg = atan2(az, sqrt(ax^2 + ay^2)) * 180/pi
+ */
+export function gravityToSimpleTiltDeg(
+  g: GVec,
+  opts: DegOptions = {}
+): { xDeg: number; yDeg: number; zDeg: number } {
+  const {
+    flipX = false, flipY = false, flipZ = false,
+    magnitudeOnly = false, normalizeSigned = true, inputIsMg = true
+  } = opts;
+
+  // Apply flips to match installed pose
+  let gx = flipX ? -g.x : g.x;
+  let gy = flipY ? -g.y : g.y;
+  let gz = flipZ ? -g.z : g.z;
+
+  // Units: mg -> g if needed
+  const scale = inputIsMg ? 1 / 1000 : 1;
+  const ax = gx * scale;
+  const ay = gy * scale;
+  const az = gz * scale;
+
+  const xDeg = toDeg(atan2(ax, Math.hypot(ay, az)));
+  const yDeg = toDeg(atan2(ay, Math.hypot(ax, az)));
+  const zDeg = toDeg(atan2(az, Math.hypot(ax, ay)));
+
+  const post = (v: number) => (normalizeSigned ? norm180(maybeAbs(v, magnitudeOnly)) : maybeAbs(v, magnitudeOnly));
+  return { xDeg: post(xDeg), yDeg: post(yDeg), zDeg: post(zDeg) };
+}
+
+// -------------------- One-call convenience: hex → all angles (deg) --------------------
+
+export function convertPayloadToDegrees(
+  payloadHex: string,
+  opts: DegOptions = {}
+): {
+  gx_mg: number; gy_mg: number; gz_mg: number;
+  thetaDeg: number; phiLocalDeg: number;
+  tiltXDeg_vendor: number; tiltZDeg_vendor: number;
+  xDeg: number; yDeg: number; zDeg: number;
+} {
+  const g = decodePayloadHex(payloadHex);
+  if (!g) {
+    throw new Error("Unsupported or malformed payload");
+  }
+
+  // For reporting clarity, compute vendor angles and simple tilt AFTER flips
+  const { flipX = false, flipY = false, flipZ = false } = opts;
+  const gv: GVec = {
+    x: flipX ? -g.x : g.x,
+    y: flipY ? -g.y : g.y,
+    z: flipZ ? -g.z : g.z
+  };
+
+  // Vendor angle set (already in degrees)
+  const thetaDeg = calculateTheta(gv);
+  const phiLocalDeg = calculateLocalPhi(gv);
+  const tiltXDeg_vendor = calculateTiltX(gv);
+  const tiltZDeg_vendor = calculateTiltZ(gv);
+
+  // Simple per-axis tilt (degrees)
+  const { xDeg, yDeg, zDeg } = gravityToSimpleTiltDeg(gv, opts);
+
+  return {
+    gx_mg: gv.x, gy_mg: gv.y, gz_mg: gv.z,
+    thetaDeg, phiLocalDeg, tiltXDeg_vendor, tiltZDeg_vendor,
+    xDeg, yDeg, zDeg
+  };
+}
+
+// -------------------- Calibration helpers --------------------
+
+/**
+ * A calibration profile combines:
+ *  - global axis flips (to match installation)
+ *  - per-axis angle offsets (degrees) applied to xDeg/yDeg/zDeg AFTER computation
+ *
+ * Example profile (derived from your matched-pose pair):
+ *   export const CALIB_POLE_V1: CalibrationProfile = {
+ *     flipX:false, flipY:false, flipZ:true,
+ *     bx:-11.69, by:+4.42, bz:-4.86
+ *   }
+ */
+export function convertWithCalibration(
+  payloadHex: string,
+  calib: CalibrationProfile = {}
+): {
+  gx_mg: number; gy_mg: number; gz_mg: number;
+  thetaDeg: number; phiLocalDeg: number;
+  tiltXDeg_vendor: number; tiltZDeg_vendor: number;
+  xDeg: number; yDeg: number; zDeg: number;
+  xDeg_cal: number; yDeg_cal: number; zDeg_cal: number;
+} {
+  const {
+    flipX = false, flipY = false, flipZ = false,
+    bx = 0, by = 0, bz = 0
+  } = calib;
+
+  const out = convertPayloadToDegrees(payloadHex, {
+    flipX, flipY, flipZ,
+    magnitudeOnly: false,
+    normalizeSigned: true,
+    inputIsMg: true
+  });
+
+  return {
+    ...out,
+    xDeg_cal: out.xDeg + bx,
+    yDeg_cal: out.yDeg + by,
+    zDeg_cal: out.zDeg + bz
+  };
+}
+
+/** Fit per-axis angle offsets from one matched still pose (Abeeway vs reference) */
+export function fitOffsetsFromPair(
+  abeewayAngles: { xDeg: number; yDeg: number; zDeg: number },
+  referenceAngles: { xDeg: number; yDeg: number; zDeg: number }
+): Pick<CalibrationProfile, "bx" | "by" | "bz"> {
+  return {
+    bx: referenceAngles.xDeg - abeewayAngles.xDeg,
+    by: referenceAngles.yDeg - abeewayAngles.yDeg,
+    bz: referenceAngles.zDeg - abeewayAngles.zDeg
+  };
+}
+
+// -------------------- Example CLI (optional) --------------------
+// Run: ts-node pole-tilt.ts 0a001a7f0002009603e4ffe100
+
+if (require.main === module) {
+  const hex = process.argv[2];
+  if (!hex) {
+    console.error("Usage: ts-node pole-tilt.ts <hexPayload>");
+    process.exit(1);
+  }
+
+  // Example: defaults (no flips, mg input)
+  const out = convertPayloadToDegrees(hex, {
+    flipX: false, flipY: false, flipZ: false,
+    magnitudeOnly: false, normalizeSigned: true, inputIsMg: true
+  });
+  console.log("Raw:", out);
+
+  // Example calibration derived from your matched-pose pair (adjust as needed)
+  const CALIB_POLE_V1: CalibrationProfile = {
+    flipX: false, flipY: false, flipZ: true,
+    bx: -11.69, by: +4.42, bz: -4.86
+  };
+  const outCal = convertWithCalibration(hex, CALIB_POLE_V1);
+  console.log("Calibrated:", {
+    xDeg: outCal.xDeg_cal,
+    yDeg: outCal.yDeg_cal,
+    zDeg: outCal.zDeg_cal
+  });
+}
